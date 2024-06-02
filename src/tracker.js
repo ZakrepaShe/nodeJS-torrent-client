@@ -22,7 +22,6 @@ export const getPeers = (torrent, callback) => {
       udpSend(socket, announceReq, url);
     } else if (respType(response) === 'announce') {
       // 4. parse announce response
-      console.log('response', response);
       const announceResp = parseAnnounceResp(response);
       // 5. pass peers to callback
       callback(announceResp.peers);
@@ -86,7 +85,7 @@ function buildAnnounceReq(connId, torrent) {
   // event
   buf.writeUInt32BE(0, 80);
   // ip address
-  buf.writeUInt32BE(0, 80);
+  buf.writeUInt32BE(0, 84);
   // key
   crypto.randomBytes(4).copy(buf, 88);
   // num want
