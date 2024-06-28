@@ -1,41 +1,44 @@
+import fs from 'fs';
 import net from 'net';
 import { Buffer } from 'buffer';
 import * as message from './message.js';
 import Pieces from './Pieces.js';
+import Queue from './Queue.js';
 import * as tracker from './tracker.js';
 
-export default function (torrent) {
-  const pieces = new Pieces(torrent.info.pieces.length / 20);
-  console.log(torrent.info.pieces.length / 20);
+export default function (torrent, path) {
+  const pieces = new Pieces(torrent);
+
+  const file = fs.openSync(path, 'w');
+
   tracker.getPeers(torrent, peers => {
-    peers.forEach(peer => download(peer, torrent, pieces));
+    peers.forEach(peer => download(peer, torrent, pieces, file));
   });
 };
 
-function download(peer, torrent, pieces) {
+function download(peer, torrent, pieces, file) {
   const socket = net.Socket();
-  socket.on('error', console.log);
+  socket.on('error', () => console.log('connection error :('));
   socket.connect(peer.port, peer.ip, () => {
     socket.write(message.buildHandshake(torrent));
   });
 
-  const queue = { choked: true, queue: [] };
+  const queue = new Queue(torrent);
 
-  onWholeMsg(socket, msg => msgHandler(msg, socket, pieces, queue));
+  onWholeMsg(socket, msg => msgHandler(msg, socket, pieces, queue, torrent, file));
 }
 
-function msgHandler(msg, socket, pieces, queue) {
+function msgHandler(msg, socket, pieces, queue, torrent, file) {
   if (isHandshake(msg)) {
     socket.write(message.buildInterested());
   } else {
     const m = message.parse(msg);
 
-    // we are here now 4.10.2 Pieces vs. blocks
     if (m.id === 0) chokeHandler(socket);
     if (m.id === 1) unchokeHandler(socket, pieces, queue);
-    if (m.id === 4) haveHandler(m.payload);
-    if (m.id === 5) bitfieldHandler(m.payload);
-    if (m.id === 7) pieceHandler(m.payload);
+    if (m.id === 4) haveHandler(socket, pieces, queue, m.payload);
+    if (m.id === 5) bitfieldHandler(socket, pieces, queue, m.payload);
+    if (m.id === 7) pieceHandler(socket, pieces, queue, torrent, file, m.payload);
   }
 }
 
@@ -48,30 +51,54 @@ function unchokeHandler(socket, pieces, queue) {
   requestPiece(socket, pieces, queue);
 }
 
-function haveHandler(payload, socket, pieces, queue) {
+function haveHandler(socket, pieces, queue, payload) {
   const pieceIndex = payload.readUInt32BE(0);
-  queue.push(pieceIndex);
-  if (queue.length === 1) {
-    requestPiece(socket, pieces, queue);
-  }
+  const queueEmpty = queue.length === 0;
+  queue.queue(pieceIndex);
+  if (queueEmpty) requestPiece(socket, pieces, queue);
 }
 
-function bitfieldHandler(payload) {  }
+function bitfieldHandler(socket, pieces, queue, payload) {
+  const queueEmpty = queue.length === 0;
+  payload.forEach((byte, i) => {
+    for (let j = 0; j < 8; j++) {
+      if (byte % 2) queue.queue(i * 8 + 7 - j);
+      byte = Math.floor(byte / 2);
+    }
+  });
+  if (queueEmpty) requestPiece(socket, pieces, queue);
+}
 
-function pieceHandler(payload, socket, requested, queue) {
-  queue.shift();
-  requestPiece(socket, requested, queue);
+function pieceHandler(socket, pieces, queue, torrent, file, pieceResp) {
+  pieces.addReceived(pieceResp);
+
+  pieces.printPercentDone()
+
+  const offset = pieceResp.index * torrent.info['piece length'] + pieceResp.begin;
+  fs.write(file, pieceResp.block, 0, pieceResp.block.length, offset, () => {});
+
+  if (pieces.isDone()) {
+    process.stdout.write('');
+    console.log('DONE!');
+    socket.end();
+    try {
+      fs.closeSync(file);
+      process.exit();
+    } catch(e) {}
+
+  } else {
+    requestPiece(socket,pieces, queue);
+  }
 }
 
 function requestPiece(socket, pieces, queue) {
   if (queue.choked) return null;
 
-  while (queue.queue.length) {
-    const pieceIndex = queue.queue.shift();
-    if (pieces.needed(pieceIndex)) {
-      // need to fix this
-      socket.write(message.buildRequest(pieceIndex));
-      pieces.addRequested(pieceIndex);
+  while (queue.length()) {
+    const pieceBlock = queue.deque();
+    if (pieces.needed(pieceBlock)) {
+      socket.write(message.buildRequest(pieceBlock));
+      pieces.addRequested(pieceBlock);
       break;
     }
   }
